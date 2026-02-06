@@ -1,11 +1,34 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { mockApi } from "../lib/mockApi";
-import type { CreatePostPayload, Post, SortOrder, UpdatePostPayload } from "../types";
+import type {
+  CreatePostPayload,
+  Post,
+  SortOrder,
+  UpdatePostPayload,
+} from "../types";
 
 interface ToggleLikePayload {
   postId: number;
   username: string;
 }
+
+const ALL_ORDERS: SortOrder[] = ["newer", "older"];
+
+const sortPosts = (posts: Post[], order: SortOrder): Post[] => {
+  return [...posts].sort((a, b) => {
+    const dateA = new Date(a.created_datetime).getTime();
+    const dateB = new Date(b.created_datetime).getTime();
+    return order === "newer" ? dateB - dateA : dateA - dateB;
+  });
+};
+
+const getCachedOrders = (
+  queryClient: ReturnType<typeof useQueryClient>,
+): SortOrder[] => {
+  return ALL_ORDERS.filter(
+    (order) => queryClient.getQueryData<Post[]>(["posts", order]) !== undefined,
+  );
+};
 
 export const usePosts = (sortOrder?: SortOrder) => {
   const queryClient = useQueryClient();
@@ -18,8 +41,6 @@ export const usePosts = (sortOrder?: SortOrder) => {
   const createPostMutation = useMutation({
     mutationFn: (payload: CreatePostPayload) => mockApi.createPost(payload),
     onMutate: async (newPost) => {
-      await queryClient.cancelQueries({ queryKey: ["posts"] });
-
       const optimisticPost: Post = {
         id: Date.now(),
         username: newPost.username,
@@ -29,25 +50,61 @@ export const usePosts = (sortOrder?: SortOrder) => {
         likes: 0,
         likedBy: [],
       };
-      const previousPosts = queryClient.getQueryData<Post[]>(["posts"]);
-      queryClient.setQueryData(
-        ["posts"],
-        [optimisticPost, ...(previousPosts ?? [])],
-      );
 
-      return { previousPosts, optimisticId: optimisticPost.id };
+      const previousCaches: Record<string, Post[]> = {};
+      const cachedOrders = getCachedOrders(queryClient);
+
+      for (const order of cachedOrders) {
+        await queryClient.cancelQueries({ queryKey: ["posts", order] });
+
+        const previousPosts = queryClient.getQueryData<Post[]>([
+          "posts",
+          order,
+        ]);
+        previousCaches[order] = previousPosts ?? [];
+
+        queryClient.setQueryData(
+          ["posts", order],
+          sortPosts([optimisticPost, ...(previousPosts ?? [])], order),
+        );
+      }
+
+      for (const order of ALL_ORDERS) {
+        if (!cachedOrders.includes(order)) {
+          queryClient.invalidateQueries({ queryKey: ["posts", order] });
+        }
+      }
+
+      return { previousCaches, optimisticId: optimisticPost.id };
     },
     onSuccess: (data, _variables, context) => {
-      queryClient.setQueryData(
-        ["posts"],
-        (previous: Post[] | undefined) =>
-          previous?.map((post) =>
-            post.id === context?.optimisticId ? data : post,
-          ) ?? [data],
-      );
+      const cachedOrders = getCachedOrders(queryClient);
+
+      for (const order of cachedOrders) {
+        queryClient.setQueryData(
+          ["posts", order],
+          (previous: Post[] | undefined) =>
+            sortPosts(
+              previous?.map((post) =>
+                post.id === context?.optimisticId ? data : post,
+              ) ?? [data],
+              order,
+            ),
+        );
+      }
+
+      for (const order of ALL_ORDERS) {
+        if (!cachedOrders.includes(order)) {
+          queryClient.invalidateQueries({ queryKey: ["posts", order] });
+        }
+      }
     },
     onError: (_, __, context) => {
-      queryClient.setQueryData(["posts"], context?.previousPosts);
+      if (context?.previousCaches) {
+        Object.entries(context.previousCaches).forEach(([order, posts]) => {
+          queryClient.setQueryData(["posts", order], posts);
+        });
+      }
     },
   });
 
@@ -55,38 +112,78 @@ export const usePosts = (sortOrder?: SortOrder) => {
     mutationFn: ({ id, payload }: { id: number; payload: UpdatePostPayload }) =>
       mockApi.updatePost(id, payload),
     onMutate: async ({ id, payload }) => {
-      await queryClient.cancelQueries({ queryKey: ["posts"] });
+      const previousCaches: Record<string, Post[]> = {};
+      const cachedOrders = getCachedOrders(queryClient);
 
-      const previousPosts = queryClient.getQueryData<Post[]>(["posts"]);
-      queryClient.setQueryData(
-        ["posts"],
-        previousPosts?.map((post) =>
-          post.id === id ? { ...post, ...payload } : post,
-        ) ?? [],
-      );
+      for (const order of cachedOrders) {
+        await queryClient.cancelQueries({ queryKey: ["posts", order] });
 
-      return { previousPosts };
+        const previousPosts = queryClient.getQueryData<Post[]>([
+          "posts",
+          order,
+        ]);
+        previousCaches[order] = previousPosts ?? [];
+
+        queryClient.setQueryData(
+          ["posts", order],
+          previousPosts?.map((post) =>
+            post.id === id ? { ...post, ...payload } : post,
+          ) ?? [],
+        );
+      }
+
+      for (const order of ALL_ORDERS) {
+        if (!cachedOrders.includes(order)) {
+          queryClient.invalidateQueries({ queryKey: ["posts", order] });
+        }
+      }
+
+      return { previousCaches };
     },
     onError: (_, __, context) => {
-      queryClient.setQueryData(["posts"], context?.previousPosts);
+      if (context?.previousCaches) {
+        Object.entries(context.previousCaches).forEach(([order, posts]) => {
+          queryClient.setQueryData(["posts", order], posts);
+        });
+      }
     },
   });
 
   const deletePostMutation = useMutation({
     mutationFn: (id: number) => mockApi.deletePost(id),
     onMutate: async (id) => {
-      await queryClient.cancelQueries({ queryKey: ["posts"] });
+      const previousCaches: Record<string, Post[]> = {};
+      const cachedOrders = getCachedOrders(queryClient);
 
-      const previousPosts = queryClient.getQueryData<Post[]>(["posts"]);
-      queryClient.setQueryData(
-        ["posts"],
-        previousPosts?.filter((post) => post.id !== id) ?? [],
-      );
+      for (const order of cachedOrders) {
+        await queryClient.cancelQueries({ queryKey: ["posts", order] });
 
-      return { previousPosts };
+        const previousPosts = queryClient.getQueryData<Post[]>([
+          "posts",
+          order,
+        ]);
+        previousCaches[order] = previousPosts ?? [];
+
+        queryClient.setQueryData(
+          ["posts", order],
+          previousPosts?.filter((post) => post.id !== id) ?? [],
+        );
+      }
+
+      for (const order of ALL_ORDERS) {
+        if (!cachedOrders.includes(order)) {
+          queryClient.invalidateQueries({ queryKey: ["posts", order] });
+        }
+      }
+
+      return { previousCaches };
     },
     onError: (_, __, context) => {
-      queryClient.setQueryData(["posts"], context?.previousPosts);
+      if (context?.previousCaches) {
+        Object.entries(context.previousCaches).forEach(([order, posts]) => {
+          queryClient.setQueryData(["posts", order], posts);
+        });
+      }
     },
   });
 
@@ -94,32 +191,52 @@ export const usePosts = (sortOrder?: SortOrder) => {
     mutationFn: ({ postId, username }: ToggleLikePayload) =>
       mockApi.toggleLike(postId, username),
     onMutate: async ({ postId, username }) => {
-      await queryClient.cancelQueries({ queryKey: ["posts"] });
+      const previousCaches: Record<string, Post[]> = {};
+      const cachedOrders = getCachedOrders(queryClient);
 
-      const previousPosts = queryClient.getQueryData<Post[]>(["posts"]);
-      queryClient.setQueryData(
-        ["posts"],
-        previousPosts?.map((post) => {
-          if (post.id === postId) {
-            const hasLiked = post.likedBy.includes(username);
+      for (const order of cachedOrders) {
+        await queryClient.cancelQueries({ queryKey: ["posts", order] });
 
-            return {
-              ...post,
-              likes: hasLiked ? post.likes - 1 : post.likes + 1,
-              likedBy: hasLiked
-                ? post.likedBy.filter((u) => u !== username)
-                : [...post.likedBy, username],
-            };
-          }
+        const previousPosts = queryClient.getQueryData<Post[]>([
+          "posts",
+          order,
+        ]);
+        previousCaches[order] = previousPosts ?? [];
 
-          return post;
-        }) ?? [],
-      );
+        queryClient.setQueryData(
+          ["posts", order],
+          previousPosts?.map((post) => {
+            if (post.id === postId) {
+              const hasLiked = post.likedBy.includes(username);
 
-      return { previousPosts };
+              return {
+                ...post,
+                likes: hasLiked ? post.likes - 1 : post.likes + 1,
+                likedBy: hasLiked
+                  ? post.likedBy.filter((u) => u !== username)
+                  : [...post.likedBy, username],
+              };
+            }
+
+            return post;
+          }) ?? [],
+        );
+      }
+
+      for (const order of ALL_ORDERS) {
+        if (!cachedOrders.includes(order)) {
+          queryClient.invalidateQueries({ queryKey: ["posts", order] });
+        }
+      }
+
+      return { previousCaches };
     },
     onError: (_, __, context) => {
-      queryClient.setQueryData(["posts"], context?.previousPosts);
+      if (context?.previousCaches) {
+        Object.entries(context.previousCaches).forEach(([order, posts]) => {
+          queryClient.setQueryData(["posts", order], posts);
+        });
+      }
     },
   });
 
